@@ -6,7 +6,7 @@ import pyaudio
 
 class AudioClient:
     # noinspection SpellCheckingInspection
-    def __init__(self, chunk=2048, audio_format=pyaudio.paInt16, channels=1, rate=44100, audio_buffer_size=12):
+    def __init__(self, chunk=2048, audio_format=pyaudio.paInt16, channels=1, rate=44100, audio_buffer_size=96):
         # constants
         self.CHUNK = chunk             # samples per frame
         self.FORMAT = audio_format     # audio format (bytes per sample?)
@@ -49,7 +49,8 @@ class AudioClient:
                 self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.connection.connect((self.server_address, self.server_port))
                 self.connection.settimeout(2)
-                self.connection.send(bytes("AudioClient", "utf-8"))
+                info = "AudioClient,"+str(self.buffer_size)
+                self.connection.send(bytes(info, "utf-8"))
                 data = self.connection.recv(self.CHUNK)
                 data = data.decode("utf-8").split(sep=",")
                 data = [int(d) for d in data if d != ","]
@@ -75,12 +76,14 @@ class AudioClient:
                 thread = Thread(target=self.buffer_control, name="buffer_control", daemon=True)
                 self.threads[thread.name] = thread
                 thread.start()
-                while len(self.audio_buffer) < self.buffer_size:
-                    pass
+            while len(self.audio_buffer) < self.buffer_size:
+                pass
             while self.live_stream.get_write_available() > self.CHUNK:
+                if len(self.audio_buffer) == 0:
+                    print("buffer empty")
+                    break
                 data = self.audio_buffer.pop(0) if len(self.audio_buffer) > 0 else None
-                frames_available = self.write_audio_to_stream(data)
-                # print("{} frames available for writing".format(frames_available))
+                self.write_audio_to_stream(data)
 
     def buffer_control(self):
         while True:
@@ -102,10 +105,14 @@ class AudioClient:
         data = bytes()
         while len(data) < self.CHUNK * 2:
             try:
-                data += self.connection.recv(self.CHUNK * 2)
-                if len(data) == 0:
-                    raise IOError
-            except Exception as e:
+                chunk_data = self.connection.recv(self.CHUNK * 2)
+                if len(chunk_data) == 0:
+                    raise ConnectionError
+                elif len(chunk_data) == 3 and list(chunk_data) == [0, 0, 0]:
+                    data = bytes(self.CHUNK * 2)
+                else:
+                    data += chunk_data
+            except (ConnectionError, socket.timeout) as e:
                 print("failed getting chunk:", e)
                 self.connection.close()
                 self.is_connected = False
