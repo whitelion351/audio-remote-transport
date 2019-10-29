@@ -10,8 +10,8 @@ class AudioServer:
     # noinspection SpellCheckingInspection
     def __init__(self, filename=None, chunk=2048, audio_format=pyaudio.paInt16, channels=1, rate=44100,
                  bind_address="0.0.0.0", bind_port=1060, audio_buffer_size=96, buffer_size_increment=6,
-                 buffer_optimize_time=10, config_filename="config.cfg", configure_devices=False,
-                 input_device_index=None, output_device_index=None):
+                 buffer_optimize_time=10, use_compression=0, config_filename="AudioServer_devices.cfg",
+                 configure_devices=False, input_device_index=None, output_device_index=None):
         # constants
         self.CHUNK = chunk             # samples per frame
         self.FORMAT = audio_format     # audio format (bytes per sample?)
@@ -33,10 +33,11 @@ class AudioServer:
         self.buffer_min_size = audio_buffer_size
         self.buffer_max_size = audio_buffer_size * 2
         self.buffer_size_increment = buffer_size_increment
-        self.buffer_optimize_time = buffer_optimize_time
+        self.buffer_optimize_time = buffer_optimize_time * 60
         self.audio_buffer = []
         self.buffer_id = -1
         self.highest_buffer_pos = 1
+        self.use_compression = use_compression
         print("audio server running on {}:{}".format(bind_address, bind_port))
 
         # parse command line arguments
@@ -76,7 +77,6 @@ class AudioServer:
                 except IOError:
                     print("no config file found. Please choose API and devices to use")
                     self.configure_this_instance(live_audio)
-
             self.live_stream = live_audio.open(
 
                 format=self.FORMAT,
@@ -161,15 +161,14 @@ class AudioServer:
             print("connection received from {}".format(address))
             if decodedmsg[0] == "AudioClient" and len(decodedmsg) > 1:
                 print("type is {} with buffer size {}. sending audio parameters".format(decodedmsg[0], decodedmsg[1]))
-                params = "{},{}".format(self.RATE, self.CHUNK)
+                params = "{},{},{}".format(self.RATE, self.CHUNK, self.use_compression)
                 clientsocket.send(bytes(params, "utf-8"))
                 msg = clientsocket.recv(self.CHUNK)
                 if msg.decode("utf-8") == "ok":
-                    print("client thinks it is ready")
+                    print("creating client thread {}".format(address[0]))
                     self.clients[address[0]] = clientsocket
                     thread = Thread(target=self.send_audio_loop, name=address[0],
                                     daemon=True, args=(clientsocket, address[0], int(decodedmsg[1])))
-                    print("creating client thread {}".format(thread.name))
                     self.threads[thread.name] = thread
                     thread.start()
                 else:
@@ -184,7 +183,7 @@ class AudioServer:
             clientsocket.close()
 
     def begin_rolling_buffer(self):
-        thread = Thread(target=self.rolling_buffer, daemon=True)
+        thread = Thread(target=self.rolling_buffer, name="rolling buffer", daemon=True)
         self.threads["rolling_buffer"] = thread
         thread.start()
         while len(self.audio_buffer) < self.buffer_size:
@@ -193,24 +192,106 @@ class AudioServer:
     def rolling_buffer(self):
         print("pre-filling audio buffer")
         while len(self.audio_buffer) < self.buffer_size:
-            self.audio_buffer.append(self.get_next_chunk())
+            next_chunk = self.get_next_chunk()
+            next_chunk = self.compress_data(next_chunk) if self.use_compression > 0 else next_chunk
+            self.audio_buffer.append(next_chunk)
             self.buffer_id += 1
         print("buffer pre-fill complete - ready for connections")
         last_buffer_optimize = time.time()
         while True:
-            self.audio_buffer.append(self.get_next_chunk())
-            while len(self.audio_buffer) > self.buffer_size:
-                self.audio_buffer.pop(0)
+            next_chunk = self.get_next_chunk()
+            next_chunk = self.compress_data(next_chunk) if self.use_compression > 0 else next_chunk
+            self.audio_buffer.append(next_chunk)
+            if len(self.audio_buffer) > self.buffer_size:
+                self.audio_buffer = self.audio_buffer[-self.buffer_size:]
             self.buffer_id += 1
-            if time.time() - last_buffer_optimize > self.buffer_optimize_time * 60:
-                if self.buffer_size > self.buffer_min_size and self.highest_buffer_pos < len(self.audio_buffer) - self.buffer_size_increment:
+            if time.time() - last_buffer_optimize > self.buffer_optimize_time:
+                if self.buffer_size > self.buffer_min_size \
+                        and self.highest_buffer_pos < len(self.audio_buffer) - self.buffer_size_increment:
                     self.buffer_size -= self.buffer_size_increment
-                    print("buffer use {} / {}. decreased size to {}".format(self.highest_buffer_pos,
-                                                                            len(self.audio_buffer), self.buffer_size))
+                    print("max load {} / {}. dropping size to {}".format(self.highest_buffer_pos,
+                                                                         len(self.audio_buffer), self.buffer_size))
                 else:
-                    print("buffer use {} / {}".format(self.highest_buffer_pos, len(self.audio_buffer)))
+                    print("max load {} / {}".format(self.highest_buffer_pos, len(self.audio_buffer)))
                 last_buffer_optimize = time.time()
                 self.highest_buffer_pos = 1
+
+    @staticmethod
+    def add_bytes_to_data(data, *args):
+        for arg in args:
+            data += arg
+        return data
+
+    def compress_data(self, data):
+        if self.use_compression == 1:
+            return self.compress_interpolate(data)
+        elif self.use_compression == 2:
+            return self.compress_data_fill(data)
+
+    @staticmethod
+    def compress_interpolate(data):
+        if data is None:
+            return data
+        data_cursor = 0
+        new_data = bytes()
+        while data_cursor < len(data):
+            new_data += data[data_cursor:data_cursor+2]
+            data_cursor += 4
+        return new_data
+
+    @staticmethod
+    def compress_data_fill(data):
+        if data is None:
+            return data
+        data_as_ints = []
+        cursor = [c for c in range(0, len(data), 2)]
+        for c in cursor:
+            data_as_ints.append(int.from_bytes(data[c:c + 1], "little", signed=True))
+        data = data_as_ints
+        if sum(data) < 5:
+            return bytes(2)
+        new_data = bytes()
+        new_data += data[0].to_bytes(2, "little", signed=True)
+        direction = 1 if data[1] >= data[0] else -1
+        cursor = abs(direction)
+        zero_string = False
+        while cursor < len(data) - 1:
+            if data[cursor+1] == 0 and zero_string is False:
+                new_data += direction.to_bytes(1, "little", signed=True)
+                new_data += data[cursor].to_bytes(2, "little", signed=True)
+                direction = 1
+                zero_string = True
+            elif data[cursor+1] == 0 and zero_string is True:
+                direction += 1
+            elif data[cursor+1] != 0 and zero_string is True:
+                new_data += bytes([0])
+                new_data += direction.to_bytes(2, "little", signed=True)
+                direction = 1 if data[cursor] > 0 else -1
+                zero_string = False
+            elif data[cursor + 1] >= data[cursor] and direction > 0 and zero_string is False:
+                direction += 1
+            elif data[cursor + 1] < data[cursor] and direction > 0 and zero_string is False:
+                new_data += direction.to_bytes(1, "little", signed=True)
+                new_data += data[cursor].to_bytes(2, "little", signed=True)
+                direction = -1
+            elif data[cursor + 1] > data[cursor] and direction < 0 and zero_string is False:
+                new_data += direction.to_bytes(1, "little", signed=True)
+                new_data += data[cursor].to_bytes(2, "little", signed=True)
+                direction = 1
+            elif data[cursor + 1] <= data[cursor] and direction < 0 and zero_string is False:
+                direction -= 1
+            if abs(direction) == 127:
+                new_data += direction.to_bytes(1, "little", signed=True)
+                new_data += data[cursor].to_bytes(2, "little", signed=True)
+                direction = 1 if direction > 0 else -1
+            cursor += 1
+        if data[cursor] == 0:
+            new_data += bytes([0])
+            new_data += direction.to_bytes(2, "little", signed=True)
+        else:
+            new_data += direction.to_bytes(1, "little", signed=True)
+            new_data += data[cursor].to_bytes(2, "little", signed=True)
+        return new_data
 
     def send_audio_loop(self, clientsocket, address, client_buffer_size):
         done = False
@@ -218,20 +299,18 @@ class AudioServer:
         cur_buf_pos = client_buffer_size
         while not done:
             try:
-                # print("client {} id {} max {} position {}".format(address, current_buffer_id,
-                #                                                   self.buffer_id, cur_buf_pos))
                 if cur_buf_pos < 1:
                     cur_buf_pos = 1
                     current_buffer_id = self.buffer_id
+                    print("server buffer is lagging")
                 elif cur_buf_pos > len(self.audio_buffer):
                     cur_buf_pos = len(self.audio_buffer)
                     current_buffer_id = self.buffer_id - len(self.audio_buffer)
                     if self.buffer_size + self.buffer_size_increment <= self.buffer_max_size:
                         self.buffer_size += self.buffer_size_increment
-                        print("{} is struggling. increased server buffer to {} to compensate".format(address,
-                                                                                                     self.buffer_size))
+                        print("{} is lagging. increasing server buffer to {}".format(address, self.buffer_size))
                     else:
-                        print("{} is falling behind but server buffer is maximum".format(address))
+                        print("{} is lagging but server buffer is at max ({})".format(address, self.buffer_size))
 
                 next_chunk = self.audio_buffer[-cur_buf_pos]
 
@@ -239,18 +318,29 @@ class AudioServer:
                 have_next_chunk = False
                 moved_positions = 0
                 while have_next_chunk is False:
-                    if sum(next_chunk) < 5 and cur_buf_pos > 1:
+                    if ((self.use_compression == 0 and sum(next_chunk) < 5)
+                            or self.use_compression > 0 and len(next_chunk) == 2 and next_chunk == bytes(2))\
+                            and cur_buf_pos > 2:
                         cur_buf_pos -= 1
                         current_buffer_id += 1
                         moved_positions += 1
                         next_chunk = self.audio_buffer[-cur_buf_pos]
                     else:
                         have_next_chunk = True
+                        if ((self.use_compression == 0 and sum(next_chunk) < 5)
+                                or self.use_compression > 0 and len(next_chunk) == 2 and next_chunk == bytes(2)):
+                            next_chunk = bytes(2)
                 if moved_positions > 1:
-                    print("{} moved {} positions to {} in buffer".format(address, moved_positions, cur_buf_pos))
+                    print("{} buffer move {} -> {} ({})".format(address, cur_buf_pos + moved_positions, cur_buf_pos,
+                                                                moved_positions))
                 # end buffer magic
 
-                next_chunk = self.compress_data(next_chunk)
+                if self.use_compression > 0:
+                    clientsocket.send(len(next_chunk).to_bytes(2, "little", signed=True))
+                    msg = clientsocket.recv(2)
+                    if msg != len(next_chunk).to_bytes(2, "little", signed=True):
+                        print("client did not respond properly to data size sent")
+                        raise ConnectionError
                 clientsocket.send(next_chunk)
                 msg = clientsocket.recv(self.CHUNK)
                 if current_buffer_id + 1 <= self.buffer_id:
@@ -306,19 +396,9 @@ class AudioServer:
                     print("reached end of file")
         return data
 
-    @staticmethod
-    def compress_data(data=None):
-        """Compresses audio for sending to remote clients
-           Not currently implemented"""
-        if data is None:
-            print("no data to compress")
-        elif sum(data) < 5:
-            data = bytes([0, 0, 0])
-        return data
-
 
 if __name__ == "__main__":
-    audio = AudioServer()
+    audio = AudioServer(audio_buffer_size=102,  use_compression=0)
     # audio = AudioServer(filename="freq_test.opus")
     while True:
         audio.wait_for_connection()
