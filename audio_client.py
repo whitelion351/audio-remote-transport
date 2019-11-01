@@ -3,6 +3,7 @@ from threading import Thread
 import socket
 import pyaudio
 import numpy as np
+import time
 
 
 class AudioClient:
@@ -101,7 +102,7 @@ class AudioClient:
     def fill_buffer(self):
         while len(self.audio_buffer) < self.buffer_size and self.is_connected:
             data = self.get_next_chunk()
-            data = self.decompress_data(data) if self.use_compression > 0else data
+            data = self.decompress_data(data) if self.use_compression > 0 else data
             if data is None:
                 print("a chunk was None")
                 break
@@ -115,12 +116,12 @@ class AudioClient:
             try:
                 chunk_data = self.connection.recv(data_size)
                 if len(chunk_data) == 0:
-                    raise ConnectionError
-                elif len(chunk_data) == 2:
+                    raise ConnectionError("chunk data was length 0")
+                elif len(data) == 0 and len(chunk_data) == 2:
                     if chunk_data == bytes(2):
                         data = bytes(data_size)
                     else:
-                        data_size = int.from_bytes(chunk_data, "little", signed=True)
+                        data_size = np.frombuffer(chunk_data, dtype=np.int16)[0]
                         self.connection.send(chunk_data)
                 else:
                     data += chunk_data
@@ -133,57 +134,38 @@ class AudioClient:
         return data
 
     def decompress_data(self, data):
-        if self.use_compression == 1:
+        if data is None:
+            return data
+        elif data == bytes(2):
+            return bytes(self.CHUNK * 2)
+        elif self.use_compression == 1:
             return self.decompress_interpolate(data)
         elif self.use_compression == 2:
             return self.decompress_data_fill(data)
 
     def decompress_interpolate(self, data):
-        if data is None:
-            return data
-        if sum(data) < 5:
-            return bytes(self.CHUNK * 2)
-        last_sample = self.last_sample
-        new_data = bytes()
-        d_curse_s = list(range(0, len(data), 2))
-        d_curse_f = list(range(2, len(data)+1, 2))
-        for d_curse in range(len(d_curse_s)):
-            current_sample = int.from_bytes(data[d_curse_s[d_curse]:d_curse_f[d_curse]],
-                                            byteorder="little", signed=True)
-            new_sample = last_sample + (current_sample - last_sample) // 2 if current_sample > last_sample \
-                else last_sample - (last_sample - current_sample) // 2
-            new_sample = new_sample.to_bytes(length=2, byteorder="little", signed=True)
-            new_data += new_sample + data[d_curse_s[d_curse]:d_curse_f[d_curse]]
-            last_sample = current_sample
-            d_curse += 1
-        self.last_sample = last_sample
+        x = [i for i in range(self.CHUNK)]
+        xp = np.array(range(-1, len(data), 2))
+        fp = np.zeros((len(xp),))
+        fp[0] = self.last_sample
+        fp[1:] = np.frombuffer(data, dtype=np.int16)
+        new_data = np.interp(x, xp, fp).astype(np.int16)
+        self.last_sample = new_data[-1]
+        new_data = new_data.tobytes()
         return new_data
 
     def decompress_data_fill(self, data):
-        if data is None:
-            return data
-        if len(data) == 2:
+        data = np.frombuffer(data, dtype=np.int16)
+        x = [i for i in range(self.CHUNK)]
+        xp = data[1:data[0]+1]
+        fp = data[data[0]+1:]
+        try:
+            new_data = np.interp(x, xp, fp).astype(np.int16)
+        except ValueError as e:
+            print(e)
+            print("length x {} xp {} fp {}".format(len(x), len(xp), len(fp)))
             return bytes(self.CHUNK * 2)
-        data_as_ints = []
-        cursor = [i for i in range(2, len(data), 3)]
-        data_as_ints.append(int.from_bytes(data[:2], "little", signed=True))
-        for c in cursor:
-            byte = data[c]
-            byte = (256-byte) * (-1) if byte > 127 else byte
-            data_as_ints.append(byte)
-            data_as_ints.append(int.from_bytes(data[c+1:c+3], "little", signed=True))
-        data = data_as_ints
-        new_data = bytes()
-        new_data += data[0].to_bytes(2, "little", signed=True)
-        cursor = 1
-        while cursor < len(data):
-            if data[cursor] == 0:
-                new_data += bytes(data[cursor+1] * 2)
-            else:
-                values = np.linspace(data[cursor - 1], data[cursor + 1], abs(data[cursor]) + 1).astype(np.int16)[1:]
-                for v in values:
-                    new_data += int(v).to_bytes(2, "little", signed=True)
-            cursor += 2
+        new_data = new_data.tobytes()
         return new_data
 
     def write_audio_to_stream(self, data):
