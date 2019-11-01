@@ -4,6 +4,7 @@ import socket
 from threading import Thread
 import argparse
 import time
+import numpy as np
 
 
 class AudioServer:
@@ -216,12 +217,6 @@ class AudioServer:
                 last_buffer_optimize = time.time()
                 self.highest_buffer_pos = 1
 
-    @staticmethod
-    def add_bytes_to_data(data, *args):
-        for arg in args:
-            data += arg
-        return data
-
     def compress_data(self, data):
         if self.use_compression == 1:
             return self.compress_interpolate(data)
@@ -232,68 +227,70 @@ class AudioServer:
     def compress_interpolate(data):
         if data is None:
             return data
-        data_cursor = 0
-        new_data = bytes()
-        while data_cursor < len(data):
-            new_data += data[data_cursor:data_cursor+2]
-            data_cursor += 4
+        data = np.frombuffer(data, dtype=np.int16)
+        data_value = np.sum(data)
+        if 5 > data_value > -5:
+            return bytes(2)
+        condition = []
+        for _ in range(len(data) // 2):
+            condition += [True, False]
+        new_data = data[condition].tobytes()
         return new_data
 
     @staticmethod
     def compress_data_fill(data):
         if data is None:
             return data
-        data_as_ints = []
-        cursor = [c for c in range(0, len(data), 2)]
-        for c in cursor:
-            data_as_ints.append(int.from_bytes(data[c:c + 1], "little", signed=True))
-        data = data_as_ints
-        if sum(data) < 5:
+        data = np.frombuffer(data, dtype=np.int16)
+        data_value = np.sum(data)
+        if 5 > data_value > -5:
             return bytes(2)
-        new_data = bytes()
-        new_data += data[0].to_bytes(2, "little", signed=True)
+        total_data_cords = 0
+        data_cords = []
+        new_data = []
         direction = 1 if data[1] >= data[0] else -1
-        cursor = abs(direction)
-        zero_string = False
-        while cursor < len(data) - 1:
-            if data[cursor+1] == 0 and zero_string is False:
-                new_data += direction.to_bytes(1, "little", signed=True)
-                new_data += data[cursor].to_bytes(2, "little", signed=True)
-                direction = 1
-                zero_string = True
-            elif data[cursor+1] == 0 and zero_string is True:
-                direction += 1
-            elif data[cursor+1] != 0 and zero_string is True:
-                new_data += bytes([0])
-                new_data += direction.to_bytes(2, "little", signed=True)
-                direction = 1 if data[cursor] > 0 else -1
-                zero_string = False
-            elif data[cursor + 1] >= data[cursor] and direction > 0 and zero_string is False:
-                direction += 1
-            elif data[cursor + 1] < data[cursor] and direction > 0 and zero_string is False:
-                new_data += direction.to_bytes(1, "little", signed=True)
-                new_data += data[cursor].to_bytes(2, "little", signed=True)
+        matching_values = False
+        last_value = None
+        for cursor, value in enumerate(data):
+            if cursor == 0:
+                new_data.append(value)
+                data_cords.append(cursor)
+                total_data_cords += 1
+            elif cursor == len(data) - 1:
+                new_data.append(value)
+                data_cords.append(cursor)
+                total_data_cords += 1
+            elif value < last_value and direction == 1:
+                new_data.append(data[cursor-1])
+                data_cords.append(cursor-1)
+                total_data_cords += 1
                 direction = -1
-            elif data[cursor + 1] > data[cursor] and direction < 0 and zero_string is False:
-                new_data += direction.to_bytes(1, "little", signed=True)
-                new_data += data[cursor].to_bytes(2, "little", signed=True)
+            elif value > last_value and direction == -1:
+                new_data.append(data[cursor-1])
+                data_cords.append(cursor-1)
+                total_data_cords += 1
                 direction = 1
-            elif data[cursor + 1] <= data[cursor] and direction < 0 and zero_string is False:
-                direction -= 1
-            if abs(direction) == 127:
-                new_data += direction.to_bytes(1, "little", signed=True)
-                new_data += data[cursor].to_bytes(2, "little", signed=True)
-                direction = 1 if direction > 0 else -1
-            cursor += 1
-        if data[cursor] == 0:
-            new_data += bytes([0])
-            new_data += direction.to_bytes(2, "little", signed=True)
-        else:
-            new_data += direction.to_bytes(1, "little", signed=True)
-            new_data += data[cursor].to_bytes(2, "little", signed=True)
-        return new_data
+            elif value == last_value:
+                if not matching_values:
+                    matching_values = True
+                    new_data.append(value)
+                    data_cords.append(cursor - 1)
+                    total_data_cords += 1
+                elif data[cursor + 1] != value:
+                    matching_values = False
+                    new_data.append(value)
+                    data_cords.append(cursor)
+                    total_data_cords += 1
+                    direction = 1 if data[cursor + 1] >= value else -1
+            last_value = value
+        if total_data_cords != len(data_cords) or total_data_cords != len(new_data):
+            print("compress error. tot cords {} len cords {} len data {}".format(total_data_cords, len(data_cords),
+                                                                                 len(new_data)))
+        new_data = [total_data_cords] + data_cords + new_data
+        byte_data = np.array(new_data, dtype=np.int16).tobytes()
+        return byte_data
 
-    def send_audio_loop(self, clientsocket, address, client_buffer_size):
+    def send_audio_loop(self, client_socket, address, client_buffer_size):
         done = False
         current_buffer_id = self.buffer_id - client_buffer_size
         cur_buf_pos = client_buffer_size
@@ -319,7 +316,7 @@ class AudioServer:
                 moved_positions = 0
                 while have_next_chunk is False:
                     if ((self.use_compression == 0 and sum(next_chunk) < 5)
-                            or self.use_compression > 0 and len(next_chunk) == 2 and next_chunk == bytes(2))\
+                            or self.use_compression > 0 and next_chunk == bytes(2))\
                             and cur_buf_pos > 2:
                         cur_buf_pos -= 1
                         current_buffer_id += 1
@@ -328,7 +325,7 @@ class AudioServer:
                     else:
                         have_next_chunk = True
                         if ((self.use_compression == 0 and sum(next_chunk) < 5)
-                                or self.use_compression > 0 and len(next_chunk) == 2 and next_chunk == bytes(2)):
+                                or self.use_compression > 0 and next_chunk == bytes(2)):
                             next_chunk = bytes(2)
                 if moved_positions > 1:
                     print("{} buffer move {} -> {} ({})".format(address, cur_buf_pos + moved_positions, cur_buf_pos,
@@ -336,13 +333,13 @@ class AudioServer:
                 # end buffer magic
 
                 if self.use_compression > 0:
-                    clientsocket.send(len(next_chunk).to_bytes(2, "little", signed=True))
-                    msg = clientsocket.recv(2)
-                    if msg != len(next_chunk).to_bytes(2, "little", signed=True):
-                        print("client did not respond properly to data size sent")
-                        raise ConnectionError
-                clientsocket.send(next_chunk)
-                msg = clientsocket.recv(self.CHUNK)
+                    header = len(next_chunk).to_bytes(2, "little", signed=True)
+                    client_socket.send(header)
+                    msg = client_socket.recv(2)
+                    if msg != header:
+                        raise ConnectionError("client responded to data size {} with {}".format(header, msg))
+                client_socket.send(next_chunk)
+                msg = client_socket.recv(self.CHUNK)
                 if current_buffer_id + 1 <= self.buffer_id:
                     current_buffer_id += 1
                 cur_buf_pos = (self.buffer_id - current_buffer_id) + 1
@@ -354,13 +351,19 @@ class AudioServer:
                     print(address, e.errno, e.strerror)
                 else:
                     print("{} socket timeout".format(address))
-                self.close_connection(clientsocket, address)
+                self.close_connection(client_socket, address)
             else:
-                decodedmsg = msg.decode("utf-8")
-                if decodedmsg != "ok":
-                    print("client said '{}' so ending audio loop".format(decodedmsg))
-                    self.close_connection(clientsocket, address)
-                    done = True
+                try:
+                    decodedmsg = msg.decode("utf-8")
+                except UnicodeDecodeError:
+                    print("error decoding client msg after sent data. client sent {} instead of ok".format(msg))
+                    if self.use_compression > 0 and msg == header:
+                        print("that response matches the sent header")
+                else:
+                    if decodedmsg != "ok":
+                        print("client said '{}' so ending audio loop".format(decodedmsg))
+                        self.close_connection(client_socket, address)
+                        done = True
 
     def close_connection(self, clientsocket, address):
         try:
@@ -398,7 +401,7 @@ class AudioServer:
 
 
 if __name__ == "__main__":
-    audio = AudioServer(audio_buffer_size=102,  use_compression=0)
+    audio = AudioServer(audio_buffer_size=120,  use_compression=0)
     # audio = AudioServer(filename="freq_test.opus")
     while True:
         audio.wait_for_connection()
