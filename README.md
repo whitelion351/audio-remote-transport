@@ -8,7 +8,7 @@ You can pass 'use_compression=' and a number <= 2 when creating the server to tr
 Implemented some "buffer magic" to keep clients near the start of the buffer to reduce latency.
 
 ## requirements
-Python 3.5 or above
+Python 3.x
 
 pip install the following modules:
 
