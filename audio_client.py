@@ -1,9 +1,8 @@
 from time import sleep
 from threading import Thread
+import numpy as np
 import socket
 import pyaudio
-import numpy as np
-import time
 
 
 class AudioClient:
@@ -12,21 +11,23 @@ class AudioClient:
         # constants
         self.CHUNK = chunk             # samples per frame
         self.FORMAT = audio_format     # audio format (bytes per sample?)
-        self.CHANNELS = channels       # single channel for microphone
+        self.CHANNELS = channels       # 1 for mono, 2 for stereo
         self.RATE = rate               # samples per second
-        self.live_stream = None
-        self.connection = None
+        self.live_stream = None        # pyaudio object
+        self.connection = None         # connection to server
         self.server_address = None
         self.server_port = None
         self.is_connected = False
         self.buffer_size = audio_buffer_size
         self.audio_buffer = []
         self.use_compression = 0
-        self.last_sample = 0
+        self.last_sample = 0           # used for compression mode 1
         self.threads = {}
 
     def create_audio_stream(self):
+        """ Create pyaudio object and open stream for reading/writing audio data"""
         stream = pyaudio.PyAudio()
+        print("starting new audio stream")
         self.live_stream = stream.open(
             format=self.FORMAT,
             channels=self.CHANNELS,
@@ -39,14 +40,17 @@ class AudioClient:
         print('audio stream running')
 
     def set_server(self, address=None, port=None):
+        """Sets server IP and port. Set this before calling play_audio_stream"""
         if address is None or port is None:
             print("you need to specify an address and port, ya big ninnie")
         else:
             self.server_address = address
             self.server_port = port
 
-    def connect_to_server(self):
-        retries = 3
+    def connect_to_server(self, retry=None):
+        """Connects to server and gets audio parameters for creating the pyaudio object, i.e. sample rate, etc
+        Normally called by play_audio_stream"""
+        retries = retry if retry is not None else 3
         print("connecting to audio server at {}:{}".format(self.server_address, self.server_port))
         while retries > 0 and not self.is_connected:
             try:
@@ -75,6 +79,8 @@ class AudioClient:
                 self.create_audio_stream()
 
     def play_audio_stream(self):
+        """Called after setting server IP and port.
+        Takes care of creating buffer thread and writing audio data"""
         done = False
         while done is False:
             if "buffer_control" not in self.threads.keys():
@@ -84,7 +90,7 @@ class AudioClient:
                 self.connect_to_server()
                 self.fill_buffer()
                 thread.start()
-            while self.live_stream.get_write_available() > self.CHUNK and self.is_connected:
+            while self.live_stream.get_write_available() > self.CHUNK:
                 if len(self.audio_buffer) == 0:
                     print("buffer empty")
                     sleep(1)
@@ -93,6 +99,7 @@ class AudioClient:
                 self.write_audio_to_stream(data)
 
     def buffer_control(self):
+        """Buffer thread function. Maintains connection to server and keeps buffer full"""
         while True:
             if not self.is_connected:
                 self.connect_to_server()
@@ -100,6 +107,7 @@ class AudioClient:
                 self.fill_buffer()
 
     def fill_buffer(self):
+        """Grabs audio data from server, applies compression if enabled, and adds to buffer"""
         while len(self.audio_buffer) < self.buffer_size and self.is_connected:
             data = self.get_next_chunk()
             data = self.decompress_data(data) if self.use_compression > 0 else data
@@ -110,6 +118,8 @@ class AudioClient:
                 self.audio_buffer.append(data)
 
     def get_next_chunk(self):
+        """gets next chunk of audio data from server. When using compression, a 2 byte header is received first
+        which contains the amount of data to expect. Otherwise the amount of data is always self.CHUNK * 2"""
         data_size = self.CHUNK if self.use_compression > 0 else self.CHUNK * 2
         data = bytes()
         while len(data) < data_size:
@@ -134,6 +144,8 @@ class AudioClient:
         return data
 
     def decompress_data(self, data):
+        """Called when using compression. passes compressed data to the proper decompress function
+        I could probably use a higher order function to achieve the same result."""
         if data is None:
             return data
         elif data == bytes(2):
@@ -144,6 +156,8 @@ class AudioClient:
             return self.decompress_data_fill(data)
 
     def decompress_interpolate(self, data):
+        """self explanatory. Interpolates between all values sent from server.
+        self.last_sample is always the first element and is set by the last element of previous data"""
         x = [i for i in range(self.CHUNK)]
         xp = np.array(range(-1, len(data), 2))
         fp = np.zeros((len(xp),))
@@ -155,6 +169,7 @@ class AudioClient:
         return new_data
 
     def decompress_data_fill(self, data):
+        """magnum opus. Kind of hard to explain how this works in a doc string. just call it magic"""
         data = np.frombuffer(data, dtype=np.int16)
         x = [i for i in range(self.CHUNK)]
         xp = data[1:data[0]+1]
