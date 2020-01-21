@@ -156,7 +156,7 @@ class AudioServer:
         user_choice = int(user_choice) - 1
         output_device_info = info_list[user_choice]
         output_device_index = output_device_info["index"]
-        print("using {} for output".format(input_device_info["name"]))
+        print("using {} for output".format(output_device_info["name"]))
         self.input_device_index = input_device_index
         self.output_device_index = output_device_index
         with open(self.config_filename, "w") as file:
@@ -426,6 +426,6 @@ class AudioServer:
 
 
 if __name__ == "__main__":
-    audio = AudioServer(rate=44100, audio_buffer_size=108,  configure_devices=False, use_compression=0)
+    audio = AudioServer(rate=44100, audio_buffer_size=108,  configure_devices=True, use_compression=0)
     # audio = AudioServer(filename="../music/freqtest.mp3")
     audio.wait_for_connection()
