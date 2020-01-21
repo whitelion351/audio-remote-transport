@@ -25,6 +25,7 @@ class AudioServer:
         self.input_device_index = input_device_index
         self.output_device_index = output_device_index
         self.need_to_configure = False
+        self.config_filename = config_filename
         self.connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.bind_address = bind_address
         self.bind_port = bind_port
@@ -58,7 +59,7 @@ class AudioServer:
                 self.configure_this_instance(live_audio)
             else:
                 try:
-                    with open(config_filename, "r") as file:
+                    with open(self.config_filename, "r") as file:
                         line_index = 1
                         for line in file:
                             splits = line.split(sep=":")
@@ -85,7 +86,7 @@ class AudioServer:
                 channels=self.CHANNELS,
                 rate=self.RATE,
                 input=True,
-                output=False,
+                output=True,
                 frames_per_buffer=self.CHUNK,
                 input_device_index=self.input_device_index,
                 output_device_index=self.input_device_index
@@ -101,6 +102,18 @@ class AudioServer:
                 for buf in f:
                     self.file_stream.append(buf)
             self.file_data = self.file_data_reader()
+            live_audio = pyaudio.PyAudio()
+            self.live_stream = live_audio.open(
+
+                format=self.FORMAT,
+                channels=self.CHANNELS,
+                rate=self.RATE,
+                input=True,
+                output=True,
+                frames_per_buffer=self.CHUNK,
+                input_device_index=self.input_device_index,
+                output_device_index=self.input_device_index
+             )
 
         print('stream started')
 
@@ -146,7 +159,7 @@ class AudioServer:
         print("using {} for output".format(input_device_info["name"]))
         self.input_device_index = input_device_index
         self.output_device_index = output_device_index
-        with open("config.cfg", "w") as file:
+        with open(self.config_filename, "w") as file:
             file.write("input_device_index:" + str(self.input_device_index) + "\n")
             file.write("output_device_index:" + str(self.output_device_index) + "\n")
         return
@@ -165,7 +178,7 @@ class AudioServer:
                 print("connection received from {}".format(address))
                 if decoded_msg[0] == "AudioClient" and len(decoded_msg) > 1:
                     print("type is {} with buffer size {}. sending audio parameters".format(decoded_msg[0], decoded_msg[1]))
-                    params = "{},{},{}".format(self.RATE, self.CHUNK, self.use_compression)
+                    params = "{},{},{}, {}".format(self.RATE, self.CHUNK, self.CHANNELS, self.use_compression)
                     client_socket.send(bytes(params, "utf-8"))
                     msg = client_socket.recv(self.CHUNK)
                     d_msg = ""
@@ -176,13 +189,13 @@ class AudioServer:
                     if d_msg == "ok":
                         print("creating client thread {}".format(address[0]))
                         self.clients[address[0]] = client_socket
-                        thread = Thread(target=self.send_audio_loop, name=address[0],
-                                        daemon=True, args=(client_socket, address[0], int(decoded_msg[1])))
+                        thread = Thread(target=self.send_audio_loop, name=address[0], daemon=True,
+                                        args=(client_socket, address[0], int(decoded_msg[1]), decoded_msg[-1]))
                         self.threads[thread.name] = thread
                         thread.start()
                     else:
-                        d_msg = "'" + d_msg + "' "
-                        print("received {} {}after sending parameters. closing connection".format(msg, d_msg))
+                        d_msg = "'" + d_msg + "'"
+                        print("received {} {} after sending parameters. closing connection".format(msg, d_msg))
                         client_socket.close()
                 else:
                     print("invalid identity {}. terminating connection".format(decoded_msg))
@@ -299,7 +312,8 @@ class AudioServer:
         byte_data = np.array(new_data, dtype=np.int16).tobytes()
         return byte_data
 
-    def send_audio_loop(self, client_socket, address, client_buffer_size):
+    def send_audio_loop(self, client_socket, address, client_buffer_size, use_magic):
+        magic_enabled = True if use_magic == "true" else False
         done = False
         current_buffer_id = self.buffer_id - client_buffer_size
         cur_buf_pos = client_buffer_size if client_buffer_size < len(self.audio_buffer) - self.buffer_size_increment \
@@ -327,7 +341,7 @@ class AudioServer:
                 while have_next_chunk is False:
                     if ((self.use_compression == 0 and sum(next_chunk) < 5)
                             or self.use_compression > 0 and next_chunk == bytes(2))\
-                            and cur_buf_pos > 2:
+                            and cur_buf_pos > 2 and magic_enabled is True:
                         cur_buf_pos -= 1
                         current_buffer_id += 1
                         moved_positions += 1
@@ -335,7 +349,7 @@ class AudioServer:
                     else:
                         have_next_chunk = True
                         if ((self.use_compression == 0 and sum(next_chunk) < 5)
-                                or self.use_compression > 0 and next_chunk == bytes(2)):
+                                or self.use_compression > 0 and next_chunk == bytes(2)) and magic_enabled is True:
                             next_chunk = bytes(2)
                 if moved_positions > 1:
                     print("{} buffer move {} -> {} ({})".format(address, cur_buf_pos + moved_positions, cur_buf_pos,
@@ -395,13 +409,14 @@ class AudioServer:
 
     def get_next_chunk(self):
         if self.filename is None:
-            while self.live_stream.get_read_available() < self.CHUNK:
+            while self.live_stream.get_read_available() < self.CHUNK * self.CHANNELS:
                 time.sleep(0.1)
-            data = self.live_stream.read(self.CHUNK)
+            data = self.live_stream.read(self.CHUNK * self.CHANNELS)
 #             print("{} frames left to read".format(self.live_stream.get_read_available()))
         else:
+            self.live_stream.read(self.CHUNK)
             data = bytes()
-            while not self.file_finished and len(data) < self.CHUNK * 2:
+            while not self.file_finished and len(data) < self.CHUNK * 2 * self.CHANNELS:
                 try:
                     data += next(self.file_data)
                 except StopIteration:
@@ -412,5 +427,5 @@ class AudioServer:
 
 if __name__ == "__main__":
     audio = AudioServer(rate=44100, audio_buffer_size=108,  configure_devices=False, use_compression=0)
-    # audio = AudioServer(filename="freq_test.opus")
+    # audio = AudioServer(filename="../music/freqtest.mp3")
     audio.wait_for_connection()
