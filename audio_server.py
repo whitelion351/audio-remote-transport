@@ -89,7 +89,7 @@ class AudioServer:
                 output=True,
                 frames_per_buffer=self.CHUNK,
                 input_device_index=self.input_device_index,
-                output_device_index=self.input_device_index
+                output_device_index=self.output_device_index
              )
         else:
             self.file_stream = []
